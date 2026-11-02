@@ -40,10 +40,21 @@ func (h *Handler) Handle(ctx context.Context, msg pubsub.Message) {
 		return
 	}
 
-	if err := h.process(ctx, ev); err != nil {
-		h.log.Error("processing failed", "payment_id", ev.PaymentID, "type", ev.Type, "err", err)
+	switch err := h.process(ctx, ev); {
+	case err == nil:
+		msg.Ack()
+	case errors.Is(err, ErrUnknownPayment):
+		// Retrying cannot succeed; finance reconciles these from the logs.
+		h.log.Warn("reversal for payment that never earned points",
+			"payment_id", ev.PaymentID, "member_id", ev.MemberID, "amount_cents", ev.AmountCents, "event_id", ev.EventID)
+		msg.Ack()
+	default:
+		// Transient (ledger unavailable, context done). Every ledger operation is
+		// idempotent, so redelivery is safe even if the write was committed.
+		h.log.Error("processing failed, will be redelivered",
+			"payment_id", ev.PaymentID, "type", ev.Type, "attempt", msg.DeliveryAttempt(), "err", err)
+		msg.Nack()
 	}
-	msg.Ack()
 }
 
 func (h *Handler) process(ctx context.Context, ev events.Payment) error {
@@ -56,55 +67,46 @@ func (h *Handler) process(ctx context.Context, ev events.Payment) error {
 	return nil
 }
 
+// award records the payment's points. Deduplication by payment_id and the
+// monthly cap are enforced atomically by the ledger, not by reading first.
 func (h *Handler) award(ctx context.Context, ev events.Payment) error {
-	seen, err := h.store.HasEntry(ctx, ev.PaymentID, ledger.KindAward)
-	if err != nil {
-		return err
-	}
-	if seen {
-		return nil
-	}
-
-	month := Month(ev.OccurredAt)
-	used, err := h.store.AwardedInMonth(ctx, ev.MemberID, month)
-	if err != nil {
-		return err
-	}
-	points := h.policy.Points(ev.AmountCents)
-	if room := h.policy.MonthlyCap - used; points > room {
-		points = max(room, 0)
-	}
-
-	return h.store.Append(ctx, ledger.Entry{
+	stored, created, err := h.store.Award(ctx, ledger.Entry{
 		MemberID:  ev.MemberID,
 		PaymentID: ev.PaymentID,
 		Kind:      ledger.KindAward,
-		Points:    points,
-		Month:     month,
-	})
+		Points:    h.policy.Points(ev.AmountCents),
+		Month:     Month(ev.OccurredAt),
+	}, h.policy.MonthlyCap)
+	if err != nil {
+		return err
+	}
+	if !created {
+		h.log.Info("payment already awarded", "payment_id", ev.PaymentID, "event_id", ev.EventID, "points", stored.Points)
+	}
+	return nil
 }
 
+// reverse removes the points the payment's award entry holds, which may be
+// less than the event amount if the award was cut by the monthly cap.
 func (h *Handler) reverse(ctx context.Context, ev events.Payment) error {
-	awarded, err := h.store.HasEntry(ctx, ev.PaymentID, ledger.KindAward)
-	if err != nil {
-		return err
-	}
-	if !awarded {
+	stored, created, err := h.store.Reverse(ctx, ev.PaymentID)
+	if errors.Is(err, ledger.ErrNotAwarded) {
 		return ErrUnknownPayment
 	}
-	done, err := h.store.HasEntry(ctx, ev.PaymentID, ledger.KindReversal)
 	if err != nil {
 		return err
 	}
-	if done {
+	if !created {
+		h.log.Info("payment already reversed", "payment_id", ev.PaymentID, "event_id", ev.EventID)
 		return nil
 	}
-
-	return h.store.Append(ctx, ledger.Entry{
-		MemberID:  ev.MemberID,
-		PaymentID: ev.PaymentID,
-		Kind:      ledger.KindReversal,
-		Points:    -h.policy.Points(ev.AmountCents),
-		Month:     Month(ev.OccurredAt),
-	})
+	if stored.MemberID != ev.MemberID {
+		h.log.Warn("reversal member differs from award member; reversed the award's member",
+			"payment_id", ev.PaymentID, "event_member_id", ev.MemberID, "award_member_id", stored.MemberID)
+	}
+	if stored.Points == 0 {
+		h.log.Warn("reversal of payment that earned 0 points (monthly cap)",
+			"payment_id", ev.PaymentID, "member_id", stored.MemberID, "amount_cents", ev.AmountCents)
+	}
+	return nil
 }
